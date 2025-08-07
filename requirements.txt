@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-pybit
-requests
+httpx
+pydantic
 python-dotenv
+bybit==0.2.12
