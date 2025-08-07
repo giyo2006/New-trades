@@ -1,220 +1,141 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from pybit.unified_trading import HTTP
-import os
-import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime, timedelta
 import asyncio
+import time
+import datetime
+import requests
+import hmac
+import hashlib
+import json
 
-app = FastAPI()
+BYBIT_API_KEY = "your_api_key"
+BYBIT_API_SECRET = "your_api_secret"
+BASE_URL = "https://api.bybit.com"
+SYMBOL = "TRXUSDT"
+INTERVAL = 60  # 1-minute candles
+CONFIRM_INTERVAL = 60 * 60 * 2  # 2 hours window for 1H confirmation
 
-# === Environment Variables ===
-MAIN_API_KEY = os.getenv("MAIN_API_KEY")
-MAIN_API_SECRET = os.getenv("MAIN_API_SECRET")
-SUB_API_KEY = os.getenv("SUB_API_KEY")
-SUB_API_SECRET = os.getenv("SUB_API_SECRET")
-EMAIL_SENDER = os.getenv("EMAIL_SENDER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
-SUB_UID = os.getenv("SUB_UID")
+# ---------------------------- Utility Functions ----------------------------
 
-main_session = HTTP(api_key=MAIN_API_KEY, api_secret=MAIN_API_SECRET)
-sub_session = HTTP(api_key=SUB_API_KEY, api_secret=SUB_API_SECRET)
+def get_server_time():
+    return int(time.time() * 1000)
 
-last_trade = {"type": None, "outcome": None}
-trade_log = []
+def sign_request(params):
+    sorted_params = sorted(params.items())
+    query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+    signature = hmac.new(
+        BYBIT_API_SECRET.encode(), query_string.encode(), hashlib.sha256
+    ).hexdigest()
+    return signature
 
-# === Get Balance ===
-def get_usdt_balance(session):
-    try:
-        data = session.get_wallet_balance(accountType="UNIFIED")
-        coins = data["result"]["list"][0]["coin"]
-        usdt = next((x for x in coins if x["coin"] == "USDT"), None)
-        return float(usdt["equity"]) if usdt else 0
-    except:
-        return 0
+# ---------------------------- API Callers ----------------------------
 
-# === Rebalance ===
-def rebalance_funds():
-    try:
-        main = get_usdt_balance(main_session)
-        sub = get_usdt_balance(sub_session)
-        total = main + sub
-        target = total / 2
-        if abs(main - sub) < 0.1:
-            print("✅ Balance already even.")
-            return
-        amount = abs(main - target)
-        transfer_type = "MAIN_SUB" if main > target else "SUB_MAIN"
-        main_session.create_internal_transfer(
-            transfer_type=transfer_type,
-            coin="USDT",
-            amount=str(round(amount, 2)),
-            sub_member_id=SUB_UID
-        )
-        print("🔁 Rebalanced main/sub")
-    except Exception as e:
-        print("❌ Rebalance failed:", e)
+def get_kline(symbol, interval, limit=200):
+    endpoint = "/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": str(interval),
+        "limit": limit,
+    }
+    resp = requests.get(BASE_URL + endpoint, params=params)
+    data = resp.json()
+    return data["result"]["list"] if "result" in data else []
 
-# === Close All TRXUSDT Positions ===
-def close_trades(session, label):
-    try:
-        pos = session.get_positions(category="linear", symbol="TRXUSDT")["result"]["list"]
-        closed = False
-        for p in pos:
-            size = float(p["size"])
-            side = p["side"]
-            if size > 0:
-                close_side = "Sell" if side == "Buy" else "Buy"
-                session.place_order(
-                    category="linear",
-                    symbol="TRXUSDT",
-                    side=close_side,
-                    order_type="Market",
-                    qty=size,
-                    reduce_only=True,
-                    position_idx=0
-                )
-                print(f"✅ {label} Account: Closed {side} {size}")
-                closed = True
-        return closed
-    except Exception as e:
-        print(f"❌ {label} close failed:", e)
-        return False
+def get_price():
+    candles = get_kline(SYMBOL, 1, limit=1)
+    return float(candles[-1][4]) if candles else 0  # Closing price of latest candle
 
-# === Email Summary ===
-def send_email(subject, body):
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_SENDER
-        msg["To"] = EMAIL_RECEIVER
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print("📧 Email sent")
-    except Exception as e:
-        print("❌ Email failed:", e)
+# ---------------------------- Strategy Logic ----------------------------
 
-def summarize_trades():
-    if not trade_log:
-        return None
-    wins = sum(1 for t in trade_log if t["outcome"] == "win")
-    losses = sum(1 for t in trade_log if t["outcome"] == "loss")
-    return f"WINS: {wins}\nLOSSES: {losses}"
+def detect_color(candle):
+    open_price = float(candle[1])
+    close_price = float(candle[4])
+    return "green" if close_price > open_price else "red"
 
-@app.on_event("startup")
-async def startup():
-    async def summary_loop():
-        while True:
-            now = datetime.utcnow()
-            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0)
-            await asyncio.sleep((midnight - now).total_seconds())
-            summary = summarize_trades()
-            if summary:
-                send_email("Daily Trade Summary", summary)
-                trade_log.clear()
-    async def keep_alive():
-        while True:
-            await asyncio.sleep(3600)
-    asyncio.create_task(summary_loop())
-    asyncio.create_task(keep_alive())
+def detect_sequence(candles):
+    sequence = []
+    prev_color = None
+    for candle in candles:
+        color = detect_color(candle)
+        if color != prev_color:
+            sequence = []
+        sequence.append(candle)
+        prev_color = color
+    return sequence
 
-# === Signal Receiver ===
-@app.post("/signal")
-async def receive_signal(request: Request):
-    try:
-        body = (await request.body()).decode().strip()
-        print("\n📩 Signal:\n", body)
-        lines = body.splitlines()
-        if len(lines) < 2:
-            return JSONResponse(content={"error": "Bad format"}, status_code=400)
+def is_new_high_or_low(seq, last_confirmed, direction):
+    if direction == "buy":
+        return min([float(c[3]) for c in seq]) > last_confirmed["low"]
+    elif direction == "sell":
+        return max([float(c[2]) for c in seq]) < last_confirmed["high"]
+    return False
 
-        symbol = lines[0].strip().upper()
-        signal_type = lines[1].lower()
+def confirm_on_1h_candle(direction, since_timestamp):
+    candles = get_kline(SYMBOL, 60, limit=3)  # last 3 one-hour candles
+    for candle in candles:
+        candle_open_time = int(candle[0])
+        if candle_open_time < since_timestamp:
+            continue
+        open_price = float(candle[1])
+        high = float(candle[2])
+        low = float(candle[3])
+        if direction == "buy" and high > open_price:
+            return True
+        elif direction == "sell" and low < open_price:
+            return True
+    return False
 
-        entry = sl = tp = None
-        for line in lines:
-            if "entry:" in line.lower():
-                entry = float(line.split(":")[1])
-            elif "sl:" in line.lower():
-                sl = float(line.split(":")[1])
-            elif "tp:" in line.lower():
-                tp = float(line.split(":")[1])
+# ---------------------------- Trade Execution ----------------------------
 
-        is_buy = "buy" in signal_type
-        session = sub_session if is_buy else main_session
-        label = "Sub" if is_buy else "Main"
+def place_market_order(side, qty):
+    endpoint = "/v5/order/create"
+    timestamp = get_server_time()
+    params = {
+        "apiKey": BYBIT_API_KEY,
+        "timestamp": timestamp,
+        "recvWindow": 5000,
+        "category": "linear",
+        "symbol": SYMBOL,
+        "side": side.upper(),
+        "orderType": "Market",
+        "qty": qty,
+        "timeInForce": "GoodTillCancel",
+    }
+    params["sign"] = sign_request(params)
+    response = requests.post(BASE_URL + endpoint, data=params)
+    return response.json()
 
-        if entry and sl and tp:
-            rr = abs(entry - sl)
-            boosted = last_trade["outcome"] == "loss" and last_trade["type"] != ("buy" if is_buy else "sell")
-            tp = entry + 1.5 * rr + 0.005 * entry if boosted and is_buy else \
-                 entry - 1.5 * rr - 0.005 * entry if boosted and not is_buy else \
-                 entry + rr if is_buy else entry - rr
+# ---------------------------- Runner Loop ----------------------------
 
-            balance = get_usdt_balance(session)
-            total = get_usdt_balance(main_session) + get_usdt_balance(sub_session)
-            risk = total * 0.10
-            sl_diff = abs(entry - sl)
-            leverage = 75
-            qty_risk = risk / sl_diff
-            max_qty = ((balance * leverage) / entry) * 0.9
-            qty = max(1, round(min(qty_risk, max_qty)))
+async def run_bot():
+    last_confirmed_buy = {"low": 0}
+    last_confirmed_sell = {"high": 1e10}
+    
+    while True:
+        candles = get_kline(SYMBOL, 1, limit=50)
+        if not candles:
+            await asyncio.sleep(60)
+            continue
+        
+        seq = detect_sequence(candles)
+        color = detect_color(seq[-1])
 
-            # Entry
-            session.place_order(
-                category="linear",
-                symbol=symbol,
-                side="Buy" if is_buy else "Sell",
-                order_type="Market",
-                qty=qty,
-                position_idx=0
-            )
+        if color == "green" and is_new_high_or_low(seq, last_confirmed_buy, "buy"):
+            confirm_from = int(seq[-1][0])
+            if confirm_on_1h_candle("buy", confirm_from):
+                qty = 100  # Put your dynamic quantity logic here
+                place_market_order("Buy", qty)
+                last_confirmed_buy["low"] = min([float(c[3]) for c in seq])
 
-            # TP/SL
-            tick_size = float(session.get_instruments_info(category="linear", symbol=symbol)['result']['list'][0]['priceFilter']['tickSize'])
-            round_price = lambda x: round(round(x / tick_size) * tick_size, 8)
-            tp_price = round_price(tp)
-            sl_price = round_price(sl)
-            for price in [tp_price, sl_price]:
-                session.place_order(
-                    category="linear",
-                    symbol=symbol,
-                    side="Sell" if is_buy else "Buy",
-                    order_type="Limit",
-                    price=price,
-                    qty=qty,
-                    reduce_only=True,
-                    time_in_force="GoodTillCancel",
-                    close_on_trigger=True,
-                    position_idx=0
-                )
+        elif color == "red" and is_new_high_or_low(seq, last_confirmed_sell, "sell"):
+            confirm_from = int(seq[-1][0])
+            if confirm_on_1h_candle("sell", confirm_from):
+                qty = 100
+                place_market_order("Sell", qty)
+                last_confirmed_sell["high"] = max([float(c[2]) for c in seq])
+        
+        await asyncio.sleep(60)
 
-            last_trade.update({"type": "buy" if is_buy else "sell", "outcome": None})
-            rebalance_funds()
-            return {
-                "status": "Trade placed",
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "qty": qty,
-                "tp_mode": "BOOSTED" if boosted else "NORMAL"
-            }
+# ---------------------------- Main Entry ----------------------------
 
-        else:
-            closed = close_trades(session, label)
-            if closed:
-                rebalance_funds()
-                return {"status": f"{label} trades closed and rebalanced"}
-            else:
-                return {"status": "No trades to close"}
-
-    except Exception as e:
-        print("❌ Error:", str(e))
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.get("/")
-def health():
-    return {"status": "Bot is online"
+if __name__ == "__main__":
+    asyncio.run(run_bot())
