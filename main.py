@@ -1,141 +1,75 @@
-import asyncio
-import time
-import datetime
 import requests
-import hmac
-import hashlib
-import json
+import datetime
 
-BYBIT_API_KEY = "your_api_key"
-BYBIT_API_SECRET = "your_api_secret"
-BASE_URL = "https://api.bybit.com"
-SYMBOL = "TRXUSDT"
-INTERVAL = 60  # 1-minute candles
-CONFIRM_INTERVAL = 60 * 60 * 2  # 2 hours window for 1H confirmation
-
-# ---------------------------- Utility Functions ----------------------------
-
-def get_server_time():
-    return int(time.time() * 1000)
-
-def sign_request(params):
-    sorted_params = sorted(params.items())
-    query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-    signature = hmac.new(
-        BYBIT_API_SECRET.encode(), query_string.encode(), hashlib.sha256
-    ).hexdigest()
-    return signature
-
-# ---------------------------- API Callers ----------------------------
-
-def get_kline(symbol, interval, limit=200):
-    endpoint = "/v5/market/kline"
+# Function to fetch candlestick data from Bybit
+def get_bybit_ohlc(symbol="TRXUSDT", interval="5"):
+    url = "https://api.bybit.com/v5/market/kline"
     params = {
         "category": "linear",
         "symbol": symbol,
-        "interval": str(interval),
-        "limit": limit,
+        "interval": interval,
+        "limit": 2  # Get last 2 candles (to confirm latest closed candle)
     }
-    resp = requests.get(BASE_URL + endpoint, params=params)
-    data = resp.json()
-    return data["result"]["list"] if "result" in data else []
+    response = requests.get(url, params=params)
+    data = response.json()
 
-def get_price():
-    candles = get_kline(SYMBOL, 1, limit=1)
-    return float(candles[-1][4]) if candles else 0  # Closing price of latest candle
+    if data["retCode"] != 0:
+        print("Error:", data["retMsg"])
+        return None
 
-# ---------------------------- Strategy Logic ----------------------------
+    candles = data["result"]["list"]
+    return candles
 
-def detect_color(candle):
-    open_price = float(candle[1])
-    close_price = float(candle[4])
-    return "green" if close_price > open_price else "red"
+# Function to convert to Heikin Ashi candles
+def convert_to_heikin_ashi(candles):
+    ha_candles = []
+    prev_ha_close = None
+    prev_ha_open = None
 
-def detect_sequence(candles):
-    sequence = []
-    prev_color = None
-    for candle in candles:
-        color = detect_color(candle)
-        if color != prev_color:
-            sequence = []
-        sequence.append(candle)
-        prev_color = color
-    return sequence
+    for candle in reversed(candles):  # Reverse so oldest is first
+        ts, o, h, l, c, vol, turnover = candle
+        o, h, l, c = float(o), float(h), float(l), float(c)
 
-def is_new_high_or_low(seq, last_confirmed, direction):
-    if direction == "buy":
-        return min([float(c[3]) for c in seq]) > last_confirmed["low"]
-    elif direction == "sell":
-        return max([float(c[2]) for c in seq]) < last_confirmed["high"]
-    return False
+        # Calculate Heikin Ashi values
+        ha_close = (o + h + l + c) / 4
+        if prev_ha_open is None:
+            ha_open = (o + c) / 2
+        else:
+            ha_open = (prev_ha_open + prev_ha_close) / 2
 
-def confirm_on_1h_candle(direction, since_timestamp):
-    candles = get_kline(SYMBOL, 60, limit=3)  # last 3 one-hour candles
-    for candle in candles:
-        candle_open_time = int(candle[0])
-        if candle_open_time < since_timestamp:
-            continue
-        open_price = float(candle[1])
-        high = float(candle[2])
-        low = float(candle[3])
-        if direction == "buy" and high > open_price:
-            return True
-        elif direction == "sell" and low < open_price:
-            return True
-    return False
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
 
-# ---------------------------- Trade Execution ----------------------------
+        ha_candles.append({
+            "time": datetime.datetime.fromtimestamp(int(ts) / 1000),
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close
+        })
 
-def place_market_order(side, qty):
-    endpoint = "/v5/order/create"
-    timestamp = get_server_time()
-    params = {
-        "apiKey": BYBIT_API_KEY,
-        "timestamp": timestamp,
-        "recvWindow": 5000,
-        "category": "linear",
-        "symbol": SYMBOL,
-        "side": side.upper(),
-        "orderType": "Market",
-        "qty": qty,
-        "timeInForce": "GoodTillCancel",
-    }
-    params["sign"] = sign_request(params)
-    response = requests.post(BASE_URL + endpoint, data=params)
-    return response.json()
+        prev_ha_close = ha_close
+        prev_ha_open = ha_open
 
-# ---------------------------- Runner Loop ----------------------------
+    return ha_candles
 
-async def run_bot():
-    last_confirmed_buy = {"low": 0}
-    last_confirmed_sell = {"high": 1e10}
-    
-    while True:
-        candles = get_kline(SYMBOL, 1, limit=50)
-        if not candles:
-            await asyncio.sleep(60)
-            continue
-        
-        seq = detect_sequence(candles)
-        color = detect_color(seq[-1])
+# Main bot function
+def bot_log():
+    candles = get_bybit_ohlc()
+    if not candles:
+        return
 
-        if color == "green" and is_new_high_or_low(seq, last_confirmed_buy, "buy"):
-            confirm_from = int(seq[-1][0])
-            if confirm_on_1h_candle("buy", confirm_from):
-                qty = 100  # Put your dynamic quantity logic here
-                place_market_order("Buy", qty)
-                last_confirmed_buy["low"] = min([float(c[3]) for c in seq])
+    ha_candles = convert_to_heikin_ashi(candles)
 
-        elif color == "red" and is_new_high_or_low(seq, last_confirmed_sell, "sell"):
-            confirm_from = int(seq[-1][0])
-            if confirm_on_1h_candle("sell", confirm_from):
-                qty = 100
-                place_market_order("Sell", qty)
-                last_confirmed_sell["high"] = max([float(c[2]) for c in seq])
-        
-        await asyncio.sleep(60)
+    latest_candle = ha_candles[-1]  # Most recent candle
+    candle_color = "GREEN" if latest_candle["close"] > latest_candle["open"] else "RED"
 
-# ---------------------------- Main Entry ----------------------------
+    print(f"[{latest_candle['time']}] {candle_color} candle")
+    print(f"Open: {latest_candle['open']:.6f}")
+    print(f"High: {latest_candle['high']:.6f}")
+    print(f"Low:  {latest_candle['low']:.6f}")
+    print(f"Close:{latest_candle['close']:.6f}")
 
+# Run bot
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    bot_log()
